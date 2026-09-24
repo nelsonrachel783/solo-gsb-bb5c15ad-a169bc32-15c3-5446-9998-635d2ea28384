@@ -4,6 +4,8 @@
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
 """
+from __future__ import annotations
+
 import re
 from pathlib import Path
 from typing import List
@@ -248,6 +250,91 @@ def calibrate(entries: List[dict], map_t) -> List[dict]:
     return out
 
 
+# ---------------------------------------------------------------- 剪辑片段
+
+def validate_ranges(raw: List[KeepRange]) -> List[tuple]:
+    """校验保留区间并按起点排序，返回 [(start_ms, end_ms, 输入行号)]。
+
+    - 起点终点都必须可解析（起点终点均留空的行视为未填写，直接忽略）；
+    - 起点必须严格早于终点；
+    - 按起点排序后不得重叠（左闭右开：相邻区间前一个终点 <= 后一个起点即可）。
+    失败抛 ValueError。
+    """
+    parsed = []
+    for i, r in enumerate(raw, 1):
+        s, e = (r.start or "").strip(), (r.end or "").strip()
+        if not s and not e:
+            continue
+        if not s or not e:
+            raise ValueError(f"区间 {i}：起点和终点都必须填写")
+        try:
+            sm, em = parse_time(s), parse_time(e)
+        except ValueError as ex:
+            raise ValueError(f"区间 {i}：{ex}")
+        if sm >= em:
+            raise ValueError(
+                f"区间 {i}：起点（{fmt_time(sm)}）必须早于终点（{fmt_time(em)}）"
+            )
+        parsed.append((sm, em, i))
+    if not parsed:
+        raise ValueError("请至少填写 1 个保留区间")
+    parsed.sort(key=lambda x: (x[0], x[1]))
+    for k in range(1, len(parsed)):
+        ps, pe, prow = parsed[k - 1]
+        cs, ce, crow = parsed[k]
+        if cs < pe:
+            raise ValueError(
+                f"保留区间重叠：区间 {prow}（{fmt_time(ps)} --> {fmt_time(pe)}）"
+                f"与区间 {crow}（{fmt_time(cs)} --> {fmt_time(ce)}）"
+            )
+    return parsed
+
+
+def clip_entries(entries: List[dict], ranges_ms: List[tuple]) -> List[dict]:
+    """按左闭右开保留区间裁剪字幕。
+
+    对每条字幕 [s, e) 与各保留区间求交集：空交集丢弃；与多个区间相交
+    （即跨过被剪掉的片段）时拆成多条，各保留同一份正文。第 k 段交集的
+    新时间 = 交集时间 - 区间起点 + 此前所有保留区间时长之和。
+    返回按新起点排序的片段 [{new_start, new_end, lines, range_row, src_index}]。
+    """
+    # 各区间起点在剪辑后时间轴上的偏移量：此前所有保留区间时长之和
+    offsets = []
+    acc = 0
+    for sm, em, _ in ranges_ms:
+        offsets.append(acc)
+        acc += em - sm
+
+    pieces = []
+    for e in entries:
+        for k, (sm, em, row_no) in enumerate(ranges_ms):
+            cs, ce = max(e["start"], sm), min(e["end"], em)
+            if cs >= ce:  # 左闭右开，空交集（或仅端点相接）丢弃
+                continue
+            pieces.append({
+                "new_start": cs - sm + offsets[k],
+                "new_end": ce - sm + offsets[k],
+                "lines": e["lines"],
+                "range_row": row_no,
+                "src_index": e["index"],
+            })
+    pieces.sort(key=lambda p: (p["new_start"], p["new_end"]))
+    return pieces
+
+
+def _clip_prepare(req: ClipRequest):
+    """公共预处理：校验区间 + 解析 SRT + 裁剪。失败抛 400。"""
+    try:
+        ranges_ms = validate_ranges(req.ranges)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return ranges_ms, clip_entries(entries, ranges_ms)
+
+
 # ---------------------------------------------------------------- API
 
 class Anchor(BaseModel):
@@ -258,6 +345,16 @@ class Anchor(BaseModel):
 class CalibrateRequest(BaseModel):
     srt: str
     anchors: List[Anchor]
+
+
+class KeepRange(BaseModel):
+    start: str  # 保留区间起点（原视频时间）HH:MM:SS,mmm
+    end: str    # 保留区间终点（原视频时间）
+
+
+class ClipRequest(BaseModel):
+    srt: str
+    ranges: List[KeepRange]
 
 
 def _prepare(req: CalibrateRequest):
@@ -349,4 +446,45 @@ def export(req: CalibrateRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="calibrated.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 剪辑片段 API
+
+def _clip_payload(ranges_ms: List[tuple], pieces: List[dict]) -> dict:
+    return {
+        "entry_count": len(pieces),
+        "total_duration": sum(em - sm for sm, em, _ in ranges_ms),
+        "entries": [
+            {
+                "index": i + 1,
+                "src_index": p["src_index"],
+                "range_row": p["range_row"],
+                "new": f"{fmt_time(p['new_start'])} --> {fmt_time(p['new_end'])}",
+                "text": "\n".join(p["lines"]),
+            }
+            for i, p in enumerate(pieces)
+        ],
+    }
+
+
+@app.post("/api/clip/preview")
+def clip_preview(req: ClipRequest):
+    ranges_ms, pieces = _clip_prepare(req)
+    return _clip_payload(ranges_ms, pieces)
+
+
+@app.post("/api/clip/export")
+def clip_export(req: ClipRequest):
+    _, pieces = _clip_prepare(req)
+    blocks = [
+        f"{i + 1}\n{fmt_time(p['new_start'])} --> {fmt_time(p['new_end'])}\n"
+        + "\n".join(p["lines"])
+        for i, p in enumerate(pieces)
+    ]
+    content = "\n\n".join(blocks) + ("\n" if blocks else "")
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="clipped.srt"'},
     )

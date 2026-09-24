@@ -46,10 +46,23 @@
           padding: 1px 6px; font-size: 12px; margin-right: 4px; }
   .mono { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
   .toolbar { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .tabs { display: flex; gap: 8px; margin: 16px 0; }
+  .tab-btn { background: #e5e7eb; color: #374151; }
+  .tab-btn.active { background: #2563eb; color: #fff; }
+  .range-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .range-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
+           font-family: ui-monospace, Consolas, monospace; }
 </style>
 </head>
 <body>
-<h1>SRT 字幕时间校准</h1>
+<h1>SRT 字幕工具箱</h1>
+
+<div class="tabs">
+  <button class="tab-btn active" id="tab-calib" onclick="switchTab('calib')">字幕时间校准</button>
+  <button class="tab-btn" id="tab-clip" onclick="switchTab('clip')">剪辑片段字幕</button>
+</div>
+
+<div id="panel-calib">
 <p class="hint">粘贴或上传 SRT，设置至少 2 个「原字幕时刻 → 视频实际时刻」锚点。
 相邻锚点间线性插值，两端按最近一段斜率外推。存在负时间、起止倒置或与下一条重叠时禁止导出。
 锚点校验失败时会自动给出「剔除最少锚点」的修复建议，确认剔除后即可继续预演与导出。</p>
@@ -76,6 +89,37 @@
   <div id="message"></div>
   <div id="result"></div>
 </div>
+</div><!-- /panel-calib -->
+
+<div id="panel-clip" style="display:none">
+<p class="hint">粘贴或上传原 SRT，并按<b>原视频时间</b>填写多个保留区间（左闭右开，格式 HH:MM:SS,mmm）。
+区间起点须早于终点，按起点排序，<b>重叠时报错</b>（首尾相接允许）。
+每条字幕与各保留区间求交集：空交集丢弃；跨过多个区间的字幕拆成多条并保留正文。
+每段交集时间减去该区间起点，再加上此前所有保留区间时长，输出按新起点排序并从 1 连续重编号。</p>
+
+<div class="card">
+  <h2>1. 原字幕内容</h2>
+  <input type="file" id="clip-file" accept=".srt,.txt">
+  <textarea id="clip-srt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句字幕"></textarea>
+</div>
+
+<div class="card">
+  <h2>2. 保留区间（按原视频时间，起点须早于终点，不得重叠）</h2>
+  <div id="ranges"></div>
+  <button class="secondary" onclick="addRange()">+ 添加区间</button>
+</div>
+
+<div class="card">
+  <h2>3. 预览与导出</h2>
+  <div class="toolbar">
+    <button onclick="clipPreview()">预览剪辑结果</button>
+    <button id="clipExportBtn" onclick="clipExportSrt()" disabled>下载剪辑后 SRT</button>
+    <span class="hint" id="clipExportHint">请先预览</span>
+  </div>
+  <div id="clip-message"></div>
+  <div id="clip-result"></div>
+</div>
+</div><!-- /panel-clip -->
 
 <script>
 const $ = id => document.getElementById(id);
@@ -260,6 +304,126 @@ async function exportSrt() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "calibrated.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ==================================================== 剪辑片段字幕
+
+function switchTab(name) {
+  $("panel-calib").style.display = name === "calib" ? "" : "none";
+  $("panel-clip").style.display = name === "clip" ? "" : "none";
+  $("tab-calib").classList.toggle("active", name === "calib");
+  $("tab-clip").classList.toggle("active", name === "clip");
+}
+
+$("clip-file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $("clip-srt").value = r.result; };
+  r.readAsText(f);
+});
+
+function addRange(start = "", end = "") {
+  const div = document.createElement("div");
+  div.className = "range-row";
+  div.innerHTML =
+    `<span class="row-no"></span>` +
+    `<span class="hint">起点</span><input type="text" class="rstart" placeholder="00:00:00,000" value="${start}">` +
+    `<span class="hint">→ 终点</span><input type="text" class="rend" placeholder="00:00:10,000" value="${end}">` +
+    `<button class="danger" onclick="this.parentElement.remove();numberRanges()">删除</button>`;
+  $("ranges").appendChild(div);
+  numberRanges();
+}
+addRange(); addRange();
+
+function rangeRows() {
+  // 与 collectRanges 过滤规则一致：起点终点均留空的行不参与提交
+  return [...document.querySelectorAll("#ranges .range-row")]
+    .filter(row => {
+      const s = row.querySelector(".rstart").value.trim();
+      const e = row.querySelector(".rend").value.trim();
+      return s || e;
+    });
+}
+
+function numberRanges() {
+  rangeRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("ranges").addEventListener("input", () => numberRanges());
+
+function collectRanges() {
+  return rangeRows().map(row => ({
+    start: row.querySelector(".rstart").value.trim(),
+    end: row.querySelector(".rend").value.trim(),
+  }));
+}
+
+function clipPayload() {
+  return JSON.stringify({ srt: $("clip-srt").value, ranges: collectRanges() });
+}
+
+function clipShowError(msg) {
+  $("clip-message").innerHTML = `<div class="error">⚠ ${msg}</div>`;
+  $("clip-result").innerHTML = "";
+  $("clipExportBtn").disabled = true;
+}
+
+function renderClipPreview(pv) {
+  const rows = pv.entries.map(e => `
+    <tr>
+      <td>${e.index}</td>
+      <td class="mono">${escapeHtml(e.src_index)}</td>
+      <td>${e.range_row}</td>
+      <td class="mono">${escapeHtml(e.new)}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+    </tr>`).join("");
+  $("clip-result").innerHTML = `<table>
+    <tr><th>新序号</th><th>原序号</th><th>命中区间#</th><th>剪辑后时间</th><th>正文</th></tr>${rows}</table>`;
+  if (pv.entry_count === 0) {
+    $("clip-message").innerHTML = `<div class="bad-banner">✗ 所有字幕都与保留区间无交集，剪辑结果为空，仍可下载空 SRT。</div>`;
+  } else {
+    $("clip-message").innerHTML =
+      `<div class="ok-banner">✓ 共 ${pv.entry_count} 条，剪辑后总时长 ${fmtDuration(pv.total_duration)}，可以下载。</div>`;
+  }
+  $("clipExportBtn").disabled = false;
+}
+
+function fmtDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 3600)}时${String(Math.floor(s / 60) % 60).padStart(2, "0")}分${String(s % 60).padStart(2, "0")}秒`;
+}
+
+async function clipPreview() {
+  $("clip-message").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/clip/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return clipShowError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderClipPreview(data);
+  return clipShowError((data && data.detail) || "请求失败");
+}
+
+async function clipExportSrt() {
+  let res;
+  try {
+    res = await fetch("/api/clip/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return clipShowError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return clipShowError((data && data.detail) || "导出被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "clipped.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }
