@@ -46,6 +46,10 @@
           padding: 1px 6px; font-size: 12px; margin-right: 4px; }
   .mono { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
   .toolbar { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .feature-divider { border: none; border-top: 2px dashed #d1d5db; margin: 32px 0 20px; }
+  .interval-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .interval-row .row-no { color: #6b7280; font-size: 12px; width: 3.2em;
+           font-family: ui-monospace, Consolas, monospace; }
 </style>
 </head>
 <body>
@@ -55,7 +59,7 @@
 锚点校验失败时会自动给出「剔除最少锚点」的修复建议，确认剔除后即可继续预演与导出。</p>
 
 <div class="card">
-  <h2>1. 字幕内容</h2>
+  <h2>1. 字幕内容（时间校准与下方剪辑功能共用）</h2>
   <input type="file" id="file" accept=".srt,.txt">
   <textarea id="srt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句字幕"></textarea>
 </div>
@@ -75,6 +79,31 @@
   </div>
   <div id="message"></div>
   <div id="result"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="clip">剪辑片段字幕</h1>
+<p class="hint">按<strong>原视频时间</strong>填写多个保留区间（左闭右开，格式 HH:MM:SS,mmm）。
+每条字幕与各区间求交集：无交集的丢弃，跨区间的字幕拆成多条并保留正文；
+每段交集时间减去该区间起点、再累加此前区间总时长，得到剪辑后连续时间轴。
+区间起点须早于终点，按起点排序，重叠将被拒绝。</p>
+
+<div class="card">
+  <h2>4. 保留区间（至少 1 个）</h2>
+  <div class="hint" style="margin-bottom:8px">使用上方第 1 步的同一份 SRT 内容。</div>
+  <div id="clipIntervals"></div>
+  <button class="secondary" onclick="addInterval()">+ 添加区间</button>
+</div>
+
+<div class="card">
+  <h2>5. 预览与下载剪辑后 SRT</h2>
+  <div class="toolbar">
+    <button onclick="clipPreview()">预览剪辑结果</button>
+    <button id="clipExportBtn" onclick="clipExport()" disabled>下载剪辑后 SRT</button>
+    <span class="hint" id="clipExportHint">请先预览，且区间校验通过后才能下载</span>
+  </div>
+  <div id="clipMessage"></div>
+  <div id="clipResult"></div>
 </div>
 
 <script>
@@ -260,6 +289,108 @@ async function exportSrt() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "calibrated.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 剪辑片段字幕
+
+function addInterval(start = "", end = "") {
+  const div = document.createElement("div");
+  div.className = "interval-row";
+  div.innerHTML =
+    `<span class="row-no"></span>` +
+    `<span class="hint">保留</span><input type="text" class="iv-start" placeholder="起点 00:01:00,000" value="${start}">` +
+    `<span class="hint">→</span><input type="text" class="iv-end" placeholder="终点 00:02:00,000" value="${end}">` +
+    `<button class="danger" onclick="this.parentElement.remove(); numberIntervals();">删除</button>`;
+  $("clipIntervals").appendChild(div);
+  numberIntervals();
+}
+addInterval();
+
+function intervalRows() {
+  // 起止全空的行不参与提交，与锚点区域的过滤规则保持一致
+  return [...document.querySelectorAll("#clipIntervals .interval-row")]
+    .filter(row => {
+      const s = row.querySelector(".iv-start").value.trim();
+      const e = row.querySelector(".iv-end").value.trim();
+      return s || e;
+    });
+}
+
+function numberIntervals() {
+  intervalRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("clipIntervals").addEventListener("input", () => numberIntervals());
+
+function collectIntervals() {
+  return intervalRows().map(row => ({
+    start: row.querySelector(".iv-start").value.trim(),
+    end: row.querySelector(".iv-end").value.trim(),
+  }));
+}
+
+function clipPayload() {
+  return JSON.stringify({ srt: $("srt").value, intervals: collectIntervals() });
+}
+
+function showClipError(msg) {
+  $("clipMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("clipResult").innerHTML = "";
+  $("clipExportBtn").disabled = true;
+}
+
+function renderClipPreview(pv) {
+  const rows = pv.entries.map(e => `
+    <tr>
+      <td>${escapeHtml(e.index)}</td>
+      <td>${escapeHtml(e.source)}</td>
+      <td class="mono">${escapeHtml(e.old)}</td>
+      <td class="mono">${escapeHtml(e.new)}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+    </tr>`).join("");
+  $("clipResult").innerHTML = `<table>
+    <tr><th>新序号</th><th>原序号</th><th>原时间（交集）</th><th>剪辑后时间</th><th>正文</th></tr>${rows}</table>`;
+  const dur = `共 ${pv.interval_count} 个保留区间，拼接后总时长 ${pv.total_duration}，保留字幕 ${pv.entry_count} 条`;
+  if (pv.entry_count === 0) {
+    $("clipMessage").innerHTML =
+      `<div class="bad-banner">✗ ${dur}；没有任何字幕与保留区间相交，无法下载。</div>`;
+    $("clipExportBtn").disabled = true;
+  } else {
+    $("clipMessage").innerHTML = `<div class="ok-banner">✓ ${dur}，可以下载。</div>`;
+    $("clipExportBtn").disabled = false;
+  }
+}
+
+async function clipPreview() {
+  $("clipMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/clip/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return showClipError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderClipPreview(data);
+  return showClipError((data && typeof data.detail === "string") ? data.detail : "请求失败");
+}
+
+async function clipExport() {
+  let res;
+  try {
+    res = await fetch("/api/clip/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: clipPayload(),
+    });
+  } catch (e) { return showClipError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showClipError((data && typeof data.detail === "string") ? data.detail : "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "clipped.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

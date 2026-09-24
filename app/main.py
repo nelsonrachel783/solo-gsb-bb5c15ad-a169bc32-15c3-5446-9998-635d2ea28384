@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -328,6 +328,137 @@ def suggest(req: CalibrateRequest):
         plan["preview"] = None
         plan["preview_error"] = str(e)
     return plan
+
+
+# ---------------------------------------------------------------- 剪辑片段
+
+class KeepInterval(BaseModel):
+    start: str  # 原视频保留区间起点 HH:MM:SS,mmm
+    end: str    # 原视频保留区间终点 HH:MM:SS,mmm
+
+
+class ClipRequest(BaseModel):
+    srt: str
+    intervals: List[KeepInterval]
+
+
+def validate_intervals(raw: List["KeepInterval"]) -> List[tuple]:
+    """校验保留区间并按起点排序，返回 [(start_ms, end_ms, 输入行号)]。
+
+    规则：起点须严格早于终点；区间为左闭右开，故相邻区间端点相触
+    （前段终点 == 后段起点）不算重叠，严格交叉才报错。
+    """
+    rows = [r for r in raw if r.start.strip() or r.end.strip()]
+    if not rows:
+        raise ValueError("请至少填写 1 个保留区间")
+    parsed = []
+    for i, r in enumerate(rows, 1):
+        try:
+            s, e = parse_time(r.start), parse_time(r.end)
+        except ValueError as ex:
+            raise ValueError(f"保留区间 {i}：{ex}")
+        if s >= e:
+            raise ValueError(
+                f"保留区间 {i}：起点 {fmt_time(s)} 须早于终点 {fmt_time(e)}"
+            )
+        parsed.append((s, e, i))
+    parsed.sort(key=lambda x: (x[0], x[1], x[2]))
+    # 按起点排序后，相邻区间若不重叠则任意区间都不可能重叠
+    for k in range(1, len(parsed)):
+        ps, pe, prow = parsed[k - 1]
+        s, e, row = parsed[k]
+        if s < pe:  # 左闭右开：s == pe 只是端点相触，允许
+            raise ValueError(
+                f"保留区间重叠：第 {prow} 行（{fmt_time(ps)} – {fmt_time(pe)}）"
+                f"与第 {row} 行（{fmt_time(s)} – {fmt_time(e)}）"
+            )
+    return parsed
+
+
+def clip_entries(entries: List[dict], intervals: List[tuple]):
+    """按左闭右开区间裁剪字幕，返回 (新字幕列表, 保留区间总时长ms)。
+
+    对每条字幕 [start, end) 与每个保留区间求交集：空交集丢弃；跨多个
+    区间的字幕按区间拆成多条，正文原样保留。交集时间换算到拼接后的
+    连续时间轴：新时间 = 交集时间 - 区间起点 + 此前所有区间时长之和。
+    输出按新起点排序（起点相同保持原顺序）并从 1 连续重编号。
+    """
+    out = []
+    offset = 0
+    for s, e, _row in intervals:
+        for order, entry in enumerate(entries):
+            lo, hi = max(entry["start"], s), min(entry["end"], e)
+            if lo < hi:  # 左闭右开：lo == hi 为空交集
+                out.append({
+                    "index": "",
+                    "src_index": entry["index"],
+                    "src_order": order,
+                    "old_start": lo,
+                    "old_end": hi,
+                    "start": offset + lo - s,
+                    "end": offset + hi - s,
+                    "lines": entry["lines"],
+                })
+        offset += e - s
+    out.sort(key=lambda r: (r["start"], r["src_order"]))
+    for n, r in enumerate(out, 1):
+        r["index"] = str(n)
+    return out, offset
+
+
+def _clip_prepare(req: ClipRequest):
+    """剪辑功能公共预处理，成功返回 (entries, intervals)，失败抛 400。"""
+    try:
+        intervals = validate_intervals(req.intervals)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, intervals
+
+
+@app.post("/api/clip/preview")
+def clip_preview(req: ClipRequest):
+    entries, intervals = _clip_prepare(req)
+    rows, total_ms = clip_entries(entries, intervals)
+    return {
+        "entry_count": len(rows),
+        "interval_count": len(intervals),
+        "total_duration": fmt_time(total_ms),
+        "entries": [
+            {
+                "index": r["index"],
+                "source": r["src_index"],
+                "old": f"{fmt_time(r['old_start'])} --> {fmt_time(r['old_end'])}",
+                "new": f"{fmt_time(r['start'])} --> {fmt_time(r['end'])}",
+                "text": "\n".join(r["lines"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/clip/export")
+def clip_export(req: ClipRequest):
+    entries, intervals = _clip_prepare(req)
+    rows, _ = clip_entries(entries, intervals)
+    if not rows:
+        raise HTTPException(
+            status_code=400, detail="所有字幕均与保留区间无交集，没有可导出的内容"
+        )
+    blocks = [
+        f"{r['index']}\n{fmt_time(r['start'])} --> {fmt_time(r['end'])}\n"
+        + "\n".join(r["lines"])
+        for r in rows
+    ]
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="clipped.srt"'},
+    )
 
 
 @app.post("/api/export")
